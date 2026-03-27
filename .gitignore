@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+.claude/
+/tmp/d6tflow_capstone_*/
+*.egg-info/
+dist/
+build/
+.streamlit/secrets.toml
+data/

@@ -1,0 +1,15 @@
+streamlit>=1.32.0
+langgraph>=0.2.0
+langchain-core>=0.2.0
+openai>=1.12.0
+d6tflow>=0.2.8
+scikit-learn>=1.4.0
+xgboost>=2.0.0
+lightgbm>=4.3.0
+hyperopt>=0.2.7
+shap>=0.45.0
+pandas>=2.1.0
+numpy>=1.26.0
+matplotlib>=3.8.0
+seaborn>=0.13.0
+python-dotenv>=1.0.0
