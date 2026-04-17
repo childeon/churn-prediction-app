@@ -22,7 +22,14 @@ if "OPENAI_API_KEY" in st.secrets:
 
 from agents.graph import build_graph
 from agents.insight_generation import handle_chat_question
-from pipeline.config import MODEL_DISPLAY_NAMES
+from agents.chart_agent import (
+    pr_curve_figure,
+    probability_distribution_figure,
+    cumulative_gains_figure,
+    lift_chart_figure,
+)
+from agents.simulation_agent import simulate_profit, explain_simulation
+from pipeline.config import MODEL_DISPLAY_NAMES, BUSINESS_CONSTANTS
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -45,6 +52,12 @@ if "analysis_complete" not in st.session_state:
     st.session_state.analysis_complete = False
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
+if "sim_result" not in st.session_state:
+    st.session_state.sim_result = None
+if "sim_explanation" not in st.session_state:
+    st.session_state.sim_explanation = None
+if "sim_constants" not in st.session_state:
+    st.session_state.sim_constants = None
 
 # ---------------------------------------------------------------------------
 # Sidebar — Upload
@@ -127,9 +140,11 @@ if run_btn and raw_df is not None:
 if st.session_state.analysis_complete:
     state = st.session_state.pipeline_state
 
-    tab_profile, tab_results, tab_insights, tab_chat = st.tabs([
+    tab_profile, tab_results, tab_charts, tab_sim, tab_insights, tab_chat = st.tabs([
         "🔍 Data Profile",
         "📊 Model Results",
+        "📈 Charts",
+        "🔬 Simulation",
         "💡 Insights",
         "💬 Ask Questions",
     ])
@@ -252,7 +267,161 @@ if st.session_state.analysis_complete:
             st.pyplot(fig)
             plt.close(fig)
 
-    # ── Tab 2: Insights ──
+    # ── Tab 2: Charts ──
+    with tab_charts:
+        st.subheader("Model Diagnostics")
+        st.caption("Four charts built from the best model's test-set predictions.")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("**Precision-Recall Curve**")
+            fig = pr_curve_figure(state)
+            if fig:
+                st.pyplot(fig)
+                plt.close(fig)
+
+        with col2:
+            st.markdown("**Churn Probability Distribution**")
+            fig = probability_distribution_figure(state)
+            if fig:
+                st.pyplot(fig)
+                plt.close(fig)
+
+        col3, col4 = st.columns(2)
+
+        with col3:
+            st.markdown("**Cumulative Gains**")
+            fig = cumulative_gains_figure(state)
+            if fig:
+                st.pyplot(fig)
+                plt.close(fig)
+
+        with col4:
+            st.markdown("**Lift Chart by Decile**")
+            fig = lift_chart_figure(state)
+            if fig:
+                st.pyplot(fig)
+                plt.close(fig)
+
+    # ── Tab 3: Simulation ──
+    with tab_sim:
+        st.subheader("What-If Business Simulation")
+        st.caption(
+            "Adjust business assumptions and re-run the profit optimisation. "
+            "No retraining — uses the trained model's test-set predictions."
+        )
+
+        baseline_metrics = state.get("best_model_metrics", {})
+        predictions = state.get("predictions", {})
+
+        col_l, col_r = st.columns([1, 1])
+
+        with col_l:
+            st.markdown("**Adjust assumptions**")
+            cv = st.slider(
+                "Customer lifetime value ($)",
+                min_value=100, max_value=2000,
+                value=BUSINESS_CONSTANTS["customer_value"], step=50,
+            )
+            cc = st.slider(
+                "Contact cost ($)",
+                min_value=1, max_value=100,
+                value=BUSINESS_CONSTANTS["contact_cost"], step=1,
+            )
+            rsr = st.slider(
+                "Retention success rate (%)",
+                min_value=5, max_value=80,
+                value=int(BUSINESS_CONSTANTS["retention_success_rate"] * 100), step=5,
+            )
+            mcl = st.slider(
+                "Missed churn loss ($)",
+                min_value=100, max_value=2000,
+                value=BUSINESS_CONSTANTS["missed_churn_loss"], step=50,
+            )
+
+            run_sim = st.button("Run Simulation", type="primary", use_container_width=True)
+
+        if run_sim and predictions:
+            new_constants = {
+                "customer_value": cv,
+                "contact_cost": cc,
+                "retention_success_rate": rsr / 100,
+                "missed_churn_loss": mcl,
+            }
+            with st.spinner("Computing..."):
+                result = simulate_profit(
+                    y_test=predictions["y_test"],
+                    y_prob=predictions["y_prob"],
+                    **new_constants,
+                )
+                explanation = explain_simulation(
+                    baseline_metrics=baseline_metrics,
+                    baseline_constants=BUSINESS_CONSTANTS,
+                    new_result=result,
+                    new_constants=new_constants,
+                )
+            st.session_state.sim_result = result
+            st.session_state.sim_explanation = explanation
+            st.session_state.sim_constants = new_constants
+
+        with col_r:
+            st.markdown("**Results**")
+            sim = st.session_state.sim_result
+            baseline_profit = baseline_metrics.get("expected_profit", 0)
+            baseline_threshold = baseline_metrics.get("optimal_threshold", 0.5)
+
+            if sim:
+                delta_profit = sim["expected_profit"] - baseline_profit
+                delta_threshold = sim["optimal_threshold"] - baseline_threshold
+
+                m1, m2 = st.columns(2)
+                m1.metric(
+                    "Optimal Threshold",
+                    f"{sim['optimal_threshold']:.3f}",
+                    delta=f"{delta_threshold:+.3f}",
+                )
+                m2.metric(
+                    "Expected Profit",
+                    f"${sim['expected_profit']:,.0f}",
+                    delta=f"${delta_profit:+,.0f}",
+                )
+                m3, m4 = st.columns(2)
+                m3.metric("Contacts Made", f"{sim['contacts_made']:,}")
+                m4.metric("Churners Missed", f"{sim['churners_missed']:,}")
+
+                # Overlay profit curves: baseline vs new scenario
+                fig, ax = plt.subplots(figsize=(6, 3.5))
+                ax.plot(
+                    baseline_metrics["threshold_curve"],
+                    baseline_metrics["profit_curve"],
+                    color="#C8D0E0", lw=1.5, label="Baseline",
+                )
+                ax.plot(
+                    sim["threshold_curve"],
+                    sim["profit_curve"],
+                    color="#2563EB", lw=2, label="Simulation",
+                )
+                ax.axvline(baseline_threshold, color="#C8D0E0", linestyle="--", lw=1)
+                ax.axvline(sim["optimal_threshold"], color="#2563EB", linestyle="--", lw=1)
+                ax.set_xlabel("Threshold")
+                ax.set_ylabel("Expected Profit ($)")
+                ax.set_title("Profit Curve: Baseline vs Simulation")
+                ax.legend()
+                plt.tight_layout()
+                st.pyplot(fig)
+                plt.close(fig)
+
+                if st.session_state.sim_explanation:
+                    st.info(st.session_state.sim_explanation)
+            else:
+                st.markdown(
+                    f"Baseline — threshold: **{baseline_threshold:.3f}** · "
+                    f"profit: **${baseline_profit:,.0f}**"
+                )
+                st.caption("Adjust the sliders and click Run Simulation to see what changes.")
+
+    # ── Tab 4: Insights ──
     with tab_insights:
         st.subheader("AI-Generated Business Insights")
         insights = state.get("auto_insights", "")

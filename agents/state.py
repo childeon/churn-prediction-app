@@ -24,6 +24,7 @@ class PipelineState(TypedDict, total=False):
     best_model_name: str
     best_model_metrics: dict
     best_pipeline: Any                 # fitted sklearn Pipeline
+    predictions: dict                  # {"y_test": list, "y_prob": list} for best model on test set
     shap_values: Any                   # numpy array
     feature_names: list[str]
     feature_importances: list[dict]    # [{feature, importance}, ...]

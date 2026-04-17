@@ -107,11 +107,20 @@ def run_model_pipeline_node(state: PipelineState) -> dict:
     best_task = TrainModel(model_type=best["model"])
     best_pipeline = best_task.output().load()
 
+    # Store predictions for the best model (used by chart and simulation agents)
+    data = PrepareData().output().load()
+    y_prob = best_pipeline.predict_proba(data["X_test"])[:, 1]
+    predictions = {
+        "y_test": data["y_test"].tolist(),
+        "y_prob": y_prob.tolist(),
+    }
+
     return {
         "model_comparison": comparison,
         "best_model_name": best["model"],
         "best_model_metrics": best,
         "best_pipeline": best_pipeline,
+        "predictions": predictions,
         "current_step": "Models trained",
         "progress_messages": state.get("progress_messages", []) + [
             f"Trained {len(MODEL_TYPES)} models",
