@@ -17,7 +17,7 @@ from pipeline.config import (
     MODEL_TYPES,
     MODEL_DISPLAY_NAMES,
 )
-from pipeline.tasks import PrepareData, TrainModel, set_dataframe
+from pipeline.tasks import PrepareData, TrainModel, set_dataframe, set_imbalance_config
 from utils.shap_utils import compute_shap_values
 from agents.state import PipelineState
 
@@ -30,15 +30,9 @@ def clean_data_node(state: PipelineState) -> dict:
     rows_before = len(df)
 
     # Drop columns that aren't useful for modelling
+    # NaN handling was already done by missing_values_node upstream
     cols_to_drop = [c for c in COLUMNS_TO_DROP if c in df.columns]
     df = df.drop(columns=cols_to_drop)
-
-    # Fill complaint_type NaN with "None" (known pattern in this dataset)
-    if "complaint_type" in df.columns:
-        df["complaint_type"] = df["complaint_type"].fillna("None")
-
-    # Drop any remaining rows with missing values
-    df = df.dropna()
     rows_after = len(df)
 
     # Dataset summary for the insight agent later
@@ -71,8 +65,9 @@ def clean_data_node(state: PipelineState) -> dict:
 def run_model_pipeline_node(state: PipelineState) -> dict:
     df_clean = state["clean_df"]
 
-    # Inject the dataframe into the pipeline module
+    # Inject the dataframe and imbalance config into the pipeline module
     set_dataframe(df_clean)
+    set_imbalance_config(state.get("imbalance_config", {}))
 
     # Use a unique directory to avoid conflicts between runs
     session_dir = Path(f"/tmp/d6tflow_capstone_{uuid.uuid4().hex[:8]}/")

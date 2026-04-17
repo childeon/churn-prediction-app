@@ -32,5 +32,12 @@ class PipelineState(TypedDict, total=False):
     auto_insights: str                 # LLM-generated markdown
     chat_history: list[dict]           # [{role, content}, ...]
 
+    # ── Class Imbalance Agent outputs ──
+    imbalance_config: dict             # minority_ratio, is_imbalanced, class weights, primary_metric
+
+    # ── Missing Values Agent outputs ──
+    missing_profile: list[dict]        # one dict per column with missing values
+    missing_strategies: list[dict]     # LLM-proposed strategy per column (surfaced in UI for review)
+
     # ── Dataset metadata ──
     dataset_summary: dict              # shape, churn rate, etc.

@@ -91,11 +91,13 @@ if run_btn and raw_df is not None:
     initial_state = {"raw_df": raw_df, "selected_horizon": selected_horizon}
 
     step_labels = {
-        "horizon_definition": f"Step 1/5: Defining {selected_horizon}-day churn horizon...",
-        "clean_data": "Step 2/5: Cleaning data...",
-        "run_model_pipeline": "Step 3/5: Training 5 models with Bayesian optimization (this may take a few minutes)...",
-        "compute_shap": "Step 4/5: Computing SHAP explanations...",
-        "generate_insights": "Step 5/5: Generating business insights with AI...",
+        "horizon_definition": f"Step 1/7: Defining {selected_horizon}-day churn horizon...",
+        "class_imbalance": "Step 2/7: Checking class imbalance...",
+        "missing_values": "Step 3/7: Profiling and imputing missing values...",
+        "clean_data": "Step 4/7: Cleaning data...",
+        "run_model_pipeline": "Step 5/7: Training 5 models with Bayesian optimization (this may take a few minutes)...",
+        "compute_shap": "Step 6/7: Computing SHAP explanations...",
+        "generate_insights": "Step 7/7: Generating business insights with AI...",
     }
 
     final_state = dict(initial_state)
@@ -125,11 +127,57 @@ if run_btn and raw_df is not None:
 if st.session_state.analysis_complete:
     state = st.session_state.pipeline_state
 
-    tab_results, tab_insights, tab_chat = st.tabs([
+    tab_profile, tab_results, tab_insights, tab_chat = st.tabs([
+        "🔍 Data Profile",
         "📊 Model Results",
         "💡 Insights",
         "💬 Ask Questions",
     ])
+
+    # ── Tab 0: Data Profile ──
+    with tab_profile:
+        # Class Imbalance
+        st.subheader("Class Imbalance Check")
+        imb = state.get("imbalance_config", {})
+        if imb:
+            col_a, col_b, col_c = st.columns(3)
+            col_a.metric("Minority class (churn=1)", f"{imb['minority_ratio']:.1%}")
+            col_b.metric("Churned customers", f"{imb['minority_count']:,}")
+            col_c.metric("Non-churned customers", f"{imb['majority_count']:,}")
+
+            if imb.get("is_imbalanced"):
+                st.warning(
+                    f"**Imbalance detected.** Mitigation applied: "
+                    f"`class_weight=balanced` (LogReg, RF, LightGBM), "
+                    f"`scale_pos_weight={imb['xgb_scale_pos_weight']}` (XGBoost), "
+                    f"CV metric switched to `{imb['primary_metric']}`."
+                )
+            else:
+                st.success("Classes are balanced — no mitigation needed.")
+
+        st.divider()
+
+        # Missing Values
+        st.subheader("Missing Values — LLM Reasoning")
+        strategies = state.get("missing_strategies", [])
+        profile = state.get("missing_profile", [])
+        if not strategies:
+            st.success("No missing values were found in the dataset.")
+        else:
+            st.caption(
+                f"{len(strategies)} column(s) had missing values. "
+                "The LLM proposed an imputation strategy for each. "
+                "Rules were auto-applied before model training."
+            )
+            for s in strategies:
+                with st.expander(
+                    f"**{s['column']}** — {s['missing_rate']:.1%} missing · "
+                    f"strategy: `{s['strategy']}`"
+                    + (f" → `{s['fill_value']}`" if s.get("fill_value") is not None else ""),
+                    expanded=False,
+                ):
+                    st.markdown(f"**Interpretation:** {s.get('interpretation', '—')}")
+                    st.markdown(f"**Reasoning:** {s.get('reasoning', '—')}")
 
     # ── Tab 1: Model Results ──
     with tab_results:
@@ -247,14 +295,16 @@ else:
         st.markdown("""
 1. **Upload** your customer churn dataset (CSV with a `churn` column)
 2. **Select a churn horizon** (30 / 60 / 90 days) — this defines what "churned" means for the model
-3. **Click "Run Analysis"** — the system will:
-   - Build horizon labels and set the active churn target
-   - Clean the data (drop missing values)
-   - Train 5 ML models using d6tflow + Hyperopt Bayesian optimization
-   - Select the best model by ROC-AUC
-   - Compute SHAP feature explanations
-   - Generate business insights using AI
-4. **Explore results** — model comparison, feature importance, SHAP plots
-5. **Read AI insights** — automated analysis of churn drivers and retention strategies
-6. **Ask questions** — chat with the AI about your specific analysis
+3. **Click "Run Analysis"** — the system runs a 7-step offline pipeline:
+   - **Horizon definition** — builds `churn_30d/60d/90d` labels and sets the active target
+   - **Class imbalance agent** — checks target ratio, configures class weights and CV metric
+   - **Missing values agent** — profiles each column, uses LLM to reason about missingness, auto-imputes
+   - **Data cleaning** — drops identifier columns, computes dataset summary
+   - **Model training** — 5 ML models via d6tflow + Hyperopt Bayesian optimization
+   - **SHAP explainability** — computes feature importances for the best model
+   - **Insight generation** — AI-written business narrative
+4. **Data Profile tab** — view imbalance config and LLM imputation reasoning
+5. **Model Results tab** — model comparison, feature importance, SHAP plots
+6. **Insights tab** — automated analysis of churn drivers and retention strategies
+7. **Ask questions** — chat with the AI about your specific analysis
         """)

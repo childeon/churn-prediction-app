@@ -29,15 +29,22 @@ from pipeline.config import (
 )
 
 # ---------------------------------------------------------------------------
-# Module-level DataFrame holder — set before running the pipeline
+# Module-level holders — set before running the pipeline
 # ---------------------------------------------------------------------------
 _dataframe: pd.DataFrame = None
+_imbalance_config: dict = {}
 
 
 def set_dataframe(df: pd.DataFrame):
     """Call this before flow.run() to inject the clean dataset."""
     global _dataframe
     _dataframe = df
+
+
+def set_imbalance_config(config: dict):
+    """Call this before flow.run() to inject the imbalance configuration."""
+    global _imbalance_config
+    _imbalance_config = config or {}
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +94,13 @@ class TrainModel(d6tflow.tasks.TaskPickle):
         categorical_cols = X_train.select_dtypes(include=["object"]).columns
         numeric_cols = X_train.select_dtypes(exclude=["object"]).columns
 
+        cfg = _imbalance_config
+        logreg_cw = cfg.get("logreg_class_weight", "balanced")
+        rf_cw = cfg.get("rf_class_weight", "balanced")
+        lgbm_cw = cfg.get("lgbm_class_weight", "balanced")
+        xgb_spw = cfg.get("xgb_scale_pos_weight", 1.0)
+        cv_metric = cfg.get("primary_metric", "roc_auc")
+
         # Default preprocessor (no scaling)
         preprocessor = ColumnTransformer(
             transformers=[
@@ -99,7 +113,7 @@ class TrainModel(d6tflow.tasks.TaskPickle):
         if self.model_type == "logreg":
             model = LogisticRegression(
                 max_iter=5000,
-                class_weight="balanced",
+                class_weight=logreg_cw,
                 solver="lbfgs",
             )
             preprocessor = ColumnTransformer(
@@ -112,7 +126,7 @@ class TrainModel(d6tflow.tasks.TaskPickle):
 
         elif self.model_type == "rf":
             model = RandomForestClassifier(
-                class_weight="balanced",
+                class_weight=rf_cw,
                 random_state=42,
             )
             param_dist = {
@@ -131,7 +145,7 @@ class TrainModel(d6tflow.tasks.TaskPickle):
         elif self.model_type == "xgb":
             model = XGBClassifier(
                 eval_metric="logloss",
-                scale_pos_weight=9,
+                scale_pos_weight=xgb_spw,
             )
             param_dist = {
                 "model__n_estimators": [200, 500],
@@ -140,7 +154,7 @@ class TrainModel(d6tflow.tasks.TaskPickle):
             }
 
         elif self.model_type == "lgbm":
-            model = LGBMClassifier(class_weight="balanced", verbosity=-1)
+            model = LGBMClassifier(class_weight=lgbm_cw, verbosity=-1)
             param_dist = {
                 "model__n_estimators": [200, 500],
                 "model__num_leaves": [31, 50],
@@ -160,7 +174,7 @@ class TrainModel(d6tflow.tasks.TaskPickle):
             pipeline.set_params(**params)
             score = cross_val_score(
                 pipeline, X_train, y_train,
-                scoring="roc_auc", cv=3, n_jobs=-1,
+                scoring=cv_metric, cv=3, n_jobs=-1,
             ).mean()
             return {"loss": -score, "status": STATUS_OK}
 
