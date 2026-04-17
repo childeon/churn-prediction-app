@@ -29,6 +29,16 @@ def compute_shap_values(best_pipeline, X_test, model_type: str):
 
     # Pick the right SHAP explainer
     if model_type in ("rf", "gb", "xgb", "lgbm"):
+        # XGBoost 3.x stores base_score as '[value]' which older SHAP builds
+        # cannot parse. Reset it to a plain float as a compatibility shim.
+        if model_type == "xgb" and hasattr(model, "get_booster"):
+            booster = model.get_booster()
+            cfg = booster.save_config()
+            import json, re
+            raw = json.loads(cfg)
+            raw_score = raw.get("learner", {}).get("learner_model_param", {}).get("base_score", "0.5")
+            clean = re.sub(r"[\[\]]", "", str(raw_score))
+            booster.set_param("base_score", float(clean))
         explainer = shap.TreeExplainer(model)
     else:
         # Logistic Regression — use LinearExplainer
