@@ -120,11 +120,25 @@ def run_model_pipeline_node(state: PipelineState) -> dict:
 
     # Store predictions for the best model (used by chart and simulation agents)
     data = PrepareData().output().load()
-    y_prob = best_pipeline.predict_proba(data["X_test"])[:, 1]
+    X_test = data["X_test"]
+    y_test_series = data["y_test"]
+    y_prob = best_pipeline.predict_proba(X_test)[:, 1]
     predictions = {
-        "y_test": data["y_test"].tolist(),
+        "y_test": y_test_series.tolist(),
         "y_prob": y_prob.tolist(),
     }
+
+    # Build simulation profiles for customer-level what-if simulator
+    y_test_arr = y_test_series.to_numpy()
+    simulation_profiles = []
+    for i in range(len(X_test)):
+        row = X_test.iloc[i]
+        simulation_profiles.append({
+            "_sim_id": i,
+            "_actual_label": int(y_test_arr[i]),
+            "_churn_prob": float(y_prob[i]),
+            **row.to_dict(),
+        })
 
     return {
         "model_comparison": comparison,
@@ -132,6 +146,7 @@ def run_model_pipeline_node(state: PipelineState) -> dict:
         "best_model_metrics": best,
         "best_pipeline": best_pipeline,
         "predictions": predictions,
+        "simulation_profiles": simulation_profiles,
         "current_step": "Models trained",
         "progress_messages": state.get("progress_messages", []) + [
             f"Trained {len(MODEL_TYPES)} models",

@@ -88,3 +88,8 @@ class PipelineState(TypedDict, total=False):
 
     # ── Dataset metadata ──
     dataset_summary: dict              # shape, churn rate, etc.
+
+    # ── Customer Simulation Profiles (Node: run_model_pipeline) ──
+    # Test-set rows packaged for customer-level what-if simulation.
+    # Each dict has: _sim_id, _actual_label, _churn_prob, + all X_test feature columns.
+    simulation_profiles: list[dict]

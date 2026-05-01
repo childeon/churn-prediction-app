@@ -30,6 +30,12 @@ from agents.chart_agent import (
     lift_chart_figure,
 )
 from agents.simulation_agent import simulate_profit, explain_simulation
+from agents.customer_simulation_agent import (
+    predict_profile_risk,
+    simulate_feature_sensitivity,
+    rank_feature_sensitivity,
+    generate_counterfactuals,
+)
 from agents.schema_detection import detect_schema
 from pipeline.config import MODEL_DISPLAY_NAMES, BUSINESS_CONSTANTS, DEFAULT_SCHEMA
 
@@ -60,6 +66,8 @@ if "sim_explanation" not in st.session_state:
     st.session_state.sim_explanation = None
 if "sim_constants" not in st.session_state:
     st.session_state.sim_constants = None
+if "cust_sim_cache" not in st.session_state:
+    st.session_state.cust_sim_cache = {}
 if "results_explanation" not in st.session_state:
     st.session_state.results_explanation = None
 if "results_chat_history" not in st.session_state:
@@ -222,6 +230,7 @@ if run_btn and raw_df is not None:
     st.session_state.chat_history = []
     st.session_state.results_explanation = None
     st.session_state.results_chat_history = []
+    st.session_state.cust_sim_cache = {}
 
     graph = build_graph()
     initial_state = {
@@ -270,6 +279,100 @@ if run_btn and raw_df is not None:
 
     st.session_state.pipeline_state = final_state
     st.session_state.analysis_complete = True
+
+# ---------------------------------------------------------------------------
+# Customer simulator helpers
+# ---------------------------------------------------------------------------
+
+def _build_feature_metadata(clean_df: pd.DataFrame, schema: dict) -> dict:
+    """Build per-feature metadata dict used by the customer simulator.
+
+    Excludes target column. Returns:
+      col -> {type, values/quartiles/min/max/median, actionability}
+    """
+    target_col = schema.get("target_col", "")
+    id_cols = set(schema.get("id_cols", []))
+    exclude = ({target_col} | id_cols) if target_col else id_cols
+
+    NON_ACTIONABLE = {
+        "geography", "location", "country", "region", "age", "gender",
+        "city", "state", "province", "birth", "nationality", "sex",
+        "zip", "postal", "race", "ethnicity",
+    }
+    ACTIONABLE = {
+        "plan", "contract", "price", "usage", "support", "ticket",
+        "complaint", "discount", "offer", "tenure", "service", "payment",
+        "subscription", "billing", "rate", "charge", "monthly", "annual",
+        "balance", "product", "tier", "feature", "addon",
+    }
+
+    metadata: dict = {}
+    for col in clean_df.columns:
+        if col in exclude:
+            continue
+
+        col_lower = col.lower().replace("_", " ")
+        if any(k in col_lower for k in NON_ACTIONABLE):
+            actionability = "contextual"
+        elif any(k in col_lower for k in ACTIONABLE):
+            actionability = "actionable"
+        else:
+            actionability = "neutral"
+
+        series = clean_df[col].dropna()
+        if len(series) == 0:
+            continue
+
+        dtype = clean_df[col].dtype
+        unique_vals = series.unique()
+        n_unique = len(unique_vals)
+
+        is_bool = dtype == bool or pd.api.types.is_bool_dtype(dtype) or (
+            n_unique <= 2
+            and set(str(v) for v in unique_vals).issubset(
+                {"0", "1", "True", "False", "true", "false", "Yes", "No", "yes", "no"}
+            )
+        )
+
+        if is_bool:
+            metadata[col] = {
+                "type": "boolean",
+                "values": sorted(unique_vals.tolist(), key=str),
+                "actionability": actionability,
+            }
+        elif dtype == object or hasattr(dtype, "categories"):
+            top_vals = series.value_counts().head(20).index.tolist()
+            metadata[col] = {
+                "type": "categorical",
+                "values": top_vals,
+                "actionability": actionability,
+            }
+        else:
+            q1 = float(series.quantile(0.25))
+            q2 = float(series.quantile(0.50))
+            q3 = float(series.quantile(0.75))
+            metadata[col] = {
+                "type": "numeric",
+                "min": float(series.min()),
+                "max": float(series.max()),
+                "median": q2,
+                "quartiles": [q1, q2, q3],
+                "actionability": actionability,
+            }
+    return metadata
+
+
+def _sensitivity_candidates(feat: str, meta: dict) -> list:
+    """20-point candidate grid for sensitivity line/bar charts."""
+    ftype = meta.get("type", "numeric")
+    if ftype in ("categorical", "boolean"):
+        return list(meta.get("values", []))
+    fmin_v = float(meta.get("min", 0))
+    fmax_v = float(meta.get("max", 1))
+    if fmin_v >= fmax_v:
+        return [fmin_v]
+    return [fmin_v + (fmax_v - fmin_v) * i / 19 for i in range(20)]
+
 
 # ---------------------------------------------------------------------------
 # Display results
@@ -567,129 +670,419 @@ if st.session_state.analysis_complete:
             st.pyplot(fig)
             plt.close(fig)
 
-    # ── Tab 3: Simulation ──
+    # ── Tab 4: Simulation ──
     with tab_sim:
-        st.subheader("What-If Business Simulation")
-        st.caption(
-            "Adjust business assumptions and re-run the profit optimisation. "
-            "No retraining — uses the trained model's test-set predictions."
-        )
+        sim_customer_tab, sim_business_tab = st.tabs([
+            "🧑‍💼 Customer What-If Simulator",
+            "💰 Business Assumption Simulator",
+        ])
 
-        baseline_metrics = state.get("best_model_metrics", {})
-        predictions = state.get("predictions", {})
+        # ══════════════════════════════════════════════════════════════════
+        # Sub-tab A — Customer What-If Simulator
+        # ══════════════════════════════════════════════════════════════════
+        with sim_customer_tab:
+            simulation_profiles = state.get("simulation_profiles") or []
+            best_pipeline = state.get("best_pipeline")
+            clean_df_sim = state.get("clean_df")
+            schema_sim = state.get("schema") or {}
 
-        @st.fragment
-        def _simulation_fragment():
-            """Scoped rerun — pressing Run Simulation only reruns this block,
-            so the active tab never resets back to Executive Summary."""
-            col_l, col_r = st.columns([1, 1])
-
-            with col_l:
-                st.markdown("**Adjust assumptions**")
-                cv = st.slider(
-                    "Customer lifetime value ($)",
-                    min_value=100, max_value=2000,
-                    value=BUSINESS_CONSTANTS["customer_value"], step=50,
+            if not simulation_profiles or best_pipeline is None or clean_df_sim is None:
+                st.info(
+                    "Run the analysis pipeline to enable the customer simulator. "
+                    "Upload a dataset and click **Run Analysis** in the sidebar."
                 )
-                cc = st.slider(
-                    "Contact cost ($)",
-                    min_value=1, max_value=100,
-                    value=BUSINESS_CONSTANTS["contact_cost"], step=1,
-                )
-                rsr = st.slider(
-                    "Retention success rate (%)",
-                    min_value=5, max_value=80,
-                    value=int(BUSINESS_CONSTANTS["retention_success_rate"] * 100), step=5,
-                )
-                mcl = st.slider(
-                    "Missed churn loss ($)",
-                    min_value=100, max_value=2000,
-                    value=BUSINESS_CONSTANTS["missed_churn_loss"], step=50,
-                )
-                run_sim = st.button(
-                    "Run Simulation", type="primary", use_container_width=True,
-                    key="sim_run_btn",
+            else:
+                st.caption(
+                    "Select a test-set customer and edit their feature values to see how the model's "
+                    "predicted churn risk changes. These are **model-based what-if simulations**, not "
+                    "causal guarantees — profiles with different values are scored differently by the model."
                 )
 
-            if run_sim and predictions:
-                new_constants = {
-                    "customer_value": cv,
-                    "contact_cost": cc,
-                    "retention_success_rate": rsr / 100,
-                    "missed_churn_loss": mcl,
-                }
-                with st.spinner("Computing..."):
-                    result = simulate_profit(
-                        y_test=predictions["y_test"],
-                        y_prob=predictions["y_prob"],
-                        **new_constants,
-                    )
-                    explanation = explain_simulation(
-                        baseline_metrics=baseline_metrics,
-                        baseline_constants=BUSINESS_CONSTANTS,
-                        new_result=result,
-                        new_constants=new_constants,
-                    )
-                st.session_state.sim_result = result
-                st.session_state.sim_explanation = explanation
-                st.session_state.sim_constants = new_constants
+                target_col_sim = schema_sim.get("target_col", "")
+                feature_metadata = _build_feature_metadata(clean_df_sim, schema_sim)
+                feature_columns = [c for c in clean_df_sim.columns if c != target_col_sim]
 
-            with col_r:
-                st.markdown("**Results**")
-                sim = st.session_state.sim_result
-                baseline_profit = baseline_metrics.get("expected_profit", 0)
-                baseline_threshold = baseline_metrics.get("optimal_threshold", 0.5)
+                # Sort profiles by predicted churn probability descending
+                sorted_profiles = sorted(
+                    simulation_profiles, key=lambda p: p["_churn_prob"], reverse=True
+                )
 
-                if sim:
-                    delta_profit = sim["expected_profit"] - baseline_profit
-                    delta_threshold = sim["optimal_threshold"] - baseline_threshold
+                # ── Profile selector ──
+                st.subheader("Select a Customer Profile")
+                profile_labels = [
+                    f"Customer #{p['_sim_id']} — Predicted: {p['_churn_prob']:.1%} | "
+                    f"Actual: {'Churned' if p['_actual_label'] == 1 else 'Retained'}"
+                    for p in sorted_profiles
+                ]
+                selected_idx = st.selectbox(
+                    "Customer profile (sorted by predicted risk, highest first)",
+                    options=range(len(sorted_profiles)),
+                    format_func=lambda i: profile_labels[i],
+                    index=0,
+                    key="cust_sim_profile_select",
+                )
+                base_profile = sorted_profiles[selected_idx]
+                base_prob = base_profile["_churn_prob"]
+                actual_label = base_profile["_actual_label"]
 
-                    m1, m2 = st.columns(2)
-                    m1.metric(
-                        "Optimal Threshold",
-                        f"{sim['optimal_threshold']:.3f}",
-                        delta=f"{delta_threshold:+.3f}",
-                    )
-                    m2.metric(
-                        "Expected Profit",
-                        f"${sim['expected_profit']:,.0f}",
-                        delta=f"${delta_profit:+,.0f}",
-                    )
-                    m3, m4 = st.columns(2)
-                    m3.metric("Contacts Made", f"{sim['contacts_made']:,}")
-                    m4.metric("Churners Missed", f"{sim['churners_missed']:,}")
+                pc1, pc2, pc3 = st.columns(3)
+                pc1.metric("Baseline Predicted Risk", f"{base_prob:.1%}")
+                pc2.metric("Actual Outcome", "Churned" if actual_label == 1 else "Retained")
+                pc3.metric("Editable Features", str(len(feature_columns)))
 
-                    fig, ax = plt.subplots(figsize=(6, 3.5))
-                    ax.plot(
-                        baseline_metrics["threshold_curve"],
-                        baseline_metrics["profit_curve"],
-                        color="#C8D0E0", lw=1.5, label="Baseline",
+                st.divider()
+
+                # ── Feature editor + sensitivity chart side-by-side ──
+                left_col, right_col = st.columns([1, 1])
+
+                with left_col:
+                    st.subheader("Edit a Feature")
+
+                    # Order: actionable → neutral → contextual, then alphabetical
+                    _order = {"actionable": 0, "neutral": 1, "contextual": 2}
+                    sorted_feats = sorted(
+                        [f for f in feature_columns if f in feature_metadata],
+                        key=lambda f: (
+                            _order.get(feature_metadata[f].get("actionability", "neutral"), 1),
+                            f,
+                        ),
                     )
-                    ax.plot(
-                        sim["threshold_curve"],
-                        sim["profit_curve"],
-                        color="#2563EB", lw=2, label="Simulation",
+
+                    selected_feature = st.selectbox(
+                        "Feature to edit",
+                        options=sorted_feats,
+                        key="cust_sim_feature_select",
                     )
-                    ax.axvline(baseline_threshold, color="#C8D0E0", linestyle="--", lw=1)
-                    ax.axvline(sim["optimal_threshold"], color="#2563EB", linestyle="--", lw=1)
-                    ax.set_xlabel("Threshold")
-                    ax.set_ylabel("Expected Profit ($)")
-                    ax.set_title("Profit Curve: Baseline vs Simulation")
-                    ax.legend()
+
+                    meta = feature_metadata.get(selected_feature, {})
+                    current_val = base_profile.get(selected_feature)
+                    ftype = meta.get("type", "numeric")
+                    actionability = meta.get("actionability", "neutral")
+
+                    if actionability == "contextual":
+                        st.caption(
+                            "ℹ️ Contextual attribute — not typically actionable, "
+                            "but you can still explore how the model scores it."
+                        )
+                    elif actionability == "actionable":
+                        st.caption("✏️ Actionable attribute.")
+
+                    # Render appropriate widget
+                    new_val = current_val
+                    if ftype == "numeric":
+                        fmin_v = float(meta.get("min", 0))
+                        fmax_v = float(meta.get("max", 1))
+                        try:
+                            cur_f = float(current_val) if current_val is not None else float(meta.get("median", fmin_v))
+                            cur_f = max(fmin_v, min(fmax_v, cur_f))
+                        except (TypeError, ValueError):
+                            cur_f = fmin_v
+                        step_v = round(max((fmax_v - fmin_v) / 100, 0.01), 4)
+                        if fmin_v < fmax_v:
+                            new_val = st.slider(
+                                selected_feature,
+                                min_value=fmin_v, max_value=fmax_v,
+                                value=cur_f, step=step_v,
+                                key=f"cust_val_{selected_feature}",
+                            )
+                        else:
+                            st.write(f"**{selected_feature}:** {current_val} (constant in dataset)")
+                    elif ftype in ("categorical", "boolean"):
+                        options = meta.get("values", [str(current_val)])
+                        try:
+                            cur_idx = [str(v) for v in options].index(str(current_val))
+                        except ValueError:
+                            cur_idx = 0
+                        new_val = st.selectbox(
+                            selected_feature,
+                            options=options,
+                            index=cur_idx,
+                            key=f"cust_val_{selected_feature}",
+                        )
+
+                    # Compute and display the new predicted probability
+                    modified_profile = {**base_profile, selected_feature: new_val}
+                    new_prob = predict_profile_risk(best_pipeline, modified_profile, feature_columns)
+                    delta_pp = (new_prob - base_prob) * 100
+
+                    st.markdown("")
+                    r1, r2 = st.columns(2)
+                    r1.metric(
+                        "New Predicted Risk",
+                        f"{new_prob:.1%}",
+                        delta=f"{delta_pp:+.1f} pp",
+                        delta_color="inverse",
+                    )
+                    direction = "lower ↓" if delta_pp < -0.05 else ("higher ↑" if delta_pp > 0.05 else "unchanged")
+                    r2.metric("Change", f"{abs(delta_pp):.1f} pp {direction}")
+
+                    st.caption(
+                        "Model-predicted risk would change. "
+                        "This is a predictive counterfactual, not a causal estimate."
+                    )
+
+                with right_col:
+                    st.subheader(f"Sensitivity: {selected_feature}")
+                    candidates = _sensitivity_candidates(selected_feature, meta)
+                    if candidates:
+                        try:
+                            sens = simulate_feature_sensitivity(
+                                best_pipeline, base_profile, selected_feature,
+                                candidates, feature_columns,
+                            )
+                            if sens["candidate_values"]:
+                                fig, ax = plt.subplots(figsize=(6, 4))
+                                if ftype == "numeric":
+                                    ax.plot(
+                                        sens["candidate_values"],
+                                        [p * 100 for p in sens["scenario_probs"]],
+                                        color="#2563EB", lw=2, marker="o", markersize=4,
+                                    )
+                                    ax.axhline(
+                                        base_prob * 100, color="#C8D0E0",
+                                        lw=1.5, linestyle="--", label="Baseline",
+                                    )
+                                    ax.set_xlabel(selected_feature)
+                                    ax.set_ylabel("Predicted Churn Risk (%)")
+                                    ax.legend()
+                                else:
+                                    bar_colors = [
+                                        "#7C3AED" if str(v) == str(current_val) else "#2563EB"
+                                        for v in sens["candidate_values"]
+                                    ]
+                                    ax.bar(
+                                        [str(v) for v in sens["candidate_values"]],
+                                        [p * 100 for p in sens["scenario_probs"]],
+                                        color=bar_colors,
+                                    )
+                                    ax.axhline(
+                                        base_prob * 100, color="#C8D0E0",
+                                        lw=1.5, linestyle="--", label="Baseline",
+                                    )
+                                    ax.set_xlabel(selected_feature)
+                                    ax.set_ylabel("Predicted Churn Risk (%)")
+                                    ax.legend()
+                                    plt.xticks(rotation=25, ha="right")
+                                ax.set_title(f"Predicted Risk by {selected_feature}")
+                                plt.tight_layout()
+                                st.pyplot(fig)
+                                plt.close(fig)
+                            else:
+                                st.info("No valid values to plot for this feature.")
+                        except Exception as e:
+                            st.warning(f"Could not compute sensitivity: {e}")
+                    else:
+                        st.info("No candidate values available for this feature.")
+
+                st.divider()
+
+                # ── Sensitivity ranking across all features ──
+                st.subheader("Feature Sensitivity Ranking")
+                st.caption(
+                    "Features that most change this customer's predicted risk when varied. "
+                    "Purple bars = actionable features."
+                )
+
+                _rank_key = f"ranked_{base_profile['_sim_id']}"
+                if _rank_key not in st.session_state.cust_sim_cache:
+                    with st.spinner("Computing feature sensitivity..."):
+                        try:
+                            _ranked = rank_feature_sensitivity(
+                                best_pipeline, base_profile, feature_metadata,
+                                feature_columns, max_features=8,
+                            )
+                        except Exception:
+                            _ranked = []
+                    st.session_state.cust_sim_cache[_rank_key] = _ranked
+                _ranked = st.session_state.cust_sim_cache[_rank_key]
+
+                if _ranked:
+                    sr_fig, sr_ax = plt.subplots(figsize=(7, 4))
+                    _feat_names = [r["feature"] for r in reversed(_ranked)]
+                    _swings = [r["max_swing"] * 100 for r in reversed(_ranked)]
+                    _bar_colors = [
+                        "#7C3AED" if r["actionability"] == "actionable" else "#2563EB"
+                        for r in reversed(_ranked)
+                    ]
+                    sr_ax.barh(_feat_names, _swings, color=_bar_colors)
+                    sr_ax.set_xlabel("Max Probability Swing (percentage points)")
+                    sr_ax.set_title("Most Sensitive Features for This Customer")
                     plt.tight_layout()
-                    st.pyplot(fig)
-                    plt.close(fig)
-
-                    if st.session_state.sim_explanation:
-                        st.info(st.session_state.sim_explanation)
+                    st.pyplot(sr_fig)
+                    plt.close(sr_fig)
                 else:
-                    st.markdown(
-                        f"Baseline — threshold: **{baseline_threshold:.3f}** · "
-                        f"profit: **${baseline_profit:,.0f}**"
-                    )
-                    st.caption("Adjust the sliders and click Run Simulation to see what changes.")
+                    st.info("Could not compute sensitivity ranking.")
 
-        _simulation_fragment()
+                st.divider()
+
+                # ── Counterfactual analysis ──
+                st.subheader("Counterfactual Analysis")
+                st.caption(
+                    "Single-feature changes that would reduce this customer's predicted churn risk, "
+                    "ranked by largest reduction. "
+                    "_Profiles with these values are scored differently by the model — "
+                    "this is a predictive counterfactual, not a causal estimate._"
+                )
+
+                _cf_key = f"cf_{base_profile['_sim_id']}"
+                if _cf_key not in st.session_state.cust_sim_cache:
+                    with st.spinner("Generating counterfactuals..."):
+                        try:
+                            _cfs = generate_counterfactuals(
+                                best_pipeline, base_profile, feature_metadata,
+                                feature_columns, max_results=10,
+                            )
+                        except Exception:
+                            _cfs = []
+                    st.session_state.cust_sim_cache[_cf_key] = _cfs
+                _cfs = st.session_state.cust_sim_cache[_cf_key]
+
+                if _cfs:
+                    _cf_rows = [
+                        {
+                            "Feature": c["feature"],
+                            "Current Value": str(c["old_value"]),
+                            "Proposed Change": str(c["new_value"]),
+                            "Current Risk": f"{c['baseline_prob']:.1%}",
+                            "New Risk": f"{c['new_prob']:.1%}",
+                            "Risk Reduction": f"{abs(c['delta']) * 100:.1f} pp",
+                            "Actionability": c["actionability"],
+                        }
+                        for c in _cfs
+                    ]
+                    st.dataframe(pd.DataFrame(_cf_rows), use_container_width=True, hide_index=True)
+                else:
+                    st.info(
+                        "No single-feature change was found that reduces this customer's "
+                        "predicted churn risk with the available candidate values."
+                    )
+
+        # ══════════════════════════════════════════════════════════════════
+        # Sub-tab B — Business Assumption Simulator (renamed, unchanged logic)
+        # ══════════════════════════════════════════════════════════════════
+        with sim_business_tab:
+            st.subheader("Business Assumption Simulator")
+            st.caption(
+                "Adjust cost and conversion assumptions to see how the optimal decision "
+                "threshold and expected profit change. No retraining — uses the trained "
+                "model's test-set predictions. "
+                "**This simulator changes economics/threshold optimisation, not customer attributes.**"
+            )
+
+            baseline_metrics = state.get("best_model_metrics", {})
+            predictions = state.get("predictions", {})
+
+            @st.fragment
+            def _simulation_fragment():
+                """Scoped rerun — pressing Run Simulation only reruns this block."""
+                col_l, col_r = st.columns([1, 1])
+
+                with col_l:
+                    st.markdown("**Adjust assumptions**")
+                    cv = st.slider(
+                        "Customer lifetime value ($)",
+                        min_value=100, max_value=2000,
+                        value=BUSINESS_CONSTANTS["customer_value"], step=50,
+                    )
+                    cc = st.slider(
+                        "Contact cost ($)",
+                        min_value=1, max_value=100,
+                        value=BUSINESS_CONSTANTS["contact_cost"], step=1,
+                    )
+                    rsr = st.slider(
+                        "Retention success rate (%)",
+                        min_value=5, max_value=80,
+                        value=int(BUSINESS_CONSTANTS["retention_success_rate"] * 100), step=5,
+                    )
+                    mcl = st.slider(
+                        "Missed churn loss ($)",
+                        min_value=100, max_value=2000,
+                        value=BUSINESS_CONSTANTS["missed_churn_loss"], step=50,
+                    )
+                    run_sim = st.button(
+                        "Run Simulation", type="primary", use_container_width=True,
+                        key="sim_run_btn",
+                    )
+
+                if run_sim and predictions:
+                    new_constants = {
+                        "customer_value": cv,
+                        "contact_cost": cc,
+                        "retention_success_rate": rsr / 100,
+                        "missed_churn_loss": mcl,
+                    }
+                    with st.spinner("Computing..."):
+                        result = simulate_profit(
+                            y_test=predictions["y_test"],
+                            y_prob=predictions["y_prob"],
+                            **new_constants,
+                        )
+                        explanation = explain_simulation(
+                            baseline_metrics=baseline_metrics,
+                            baseline_constants=BUSINESS_CONSTANTS,
+                            new_result=result,
+                            new_constants=new_constants,
+                        )
+                    st.session_state.sim_result = result
+                    st.session_state.sim_explanation = explanation
+                    st.session_state.sim_constants = new_constants
+
+                with col_r:
+                    st.markdown("**Results**")
+                    sim = st.session_state.sim_result
+                    baseline_profit = baseline_metrics.get("expected_profit", 0)
+                    baseline_threshold = baseline_metrics.get("optimal_threshold", 0.5)
+
+                    if sim:
+                        delta_profit = sim["expected_profit"] - baseline_profit
+                        delta_threshold = sim["optimal_threshold"] - baseline_threshold
+
+                        m1, m2 = st.columns(2)
+                        m1.metric(
+                            "Optimal Threshold",
+                            f"{sim['optimal_threshold']:.3f}",
+                            delta=f"{delta_threshold:+.3f}",
+                        )
+                        m2.metric(
+                            "Expected Profit",
+                            f"${sim['expected_profit']:,.0f}",
+                            delta=f"${delta_profit:+,.0f}",
+                        )
+                        m3, m4 = st.columns(2)
+                        m3.metric("Contacts Made", f"{sim['contacts_made']:,}")
+                        m4.metric("Churners Missed", f"{sim['churners_missed']:,}")
+
+                        fig, ax = plt.subplots(figsize=(6, 3.5))
+                        ax.plot(
+                            baseline_metrics["threshold_curve"],
+                            baseline_metrics["profit_curve"],
+                            color="#C8D0E0", lw=1.5, label="Baseline",
+                        )
+                        ax.plot(
+                            sim["threshold_curve"],
+                            sim["profit_curve"],
+                            color="#2563EB", lw=2, label="Simulation",
+                        )
+                        ax.axvline(baseline_threshold, color="#C8D0E0", linestyle="--", lw=1)
+                        ax.axvline(sim["optimal_threshold"], color="#2563EB", linestyle="--", lw=1)
+                        ax.set_xlabel("Threshold")
+                        ax.set_ylabel("Expected Profit ($)")
+                        ax.set_title("Profit Curve: Baseline vs Simulation")
+                        ax.legend()
+                        plt.tight_layout()
+                        st.pyplot(fig)
+                        plt.close(fig)
+
+                        if st.session_state.sim_explanation:
+                            st.info(st.session_state.sim_explanation)
+                    else:
+                        st.markdown(
+                            f"Baseline — threshold: **{baseline_threshold:.3f}** · "
+                            f"profit: **${baseline_profit:,.0f}**"
+                        )
+                        st.caption("Adjust the sliders and click Run Simulation to see what changes.")
+
+            _simulation_fragment()
 
     # ══════════════════════════════════════════════════════════════════════
     # Tab 5 — Ask Questions (chat)
